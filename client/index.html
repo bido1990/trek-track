@@ -644,7 +644,11 @@
       var changed = times.revised && times.revised !== times.scheduled && rev.time !== sched.time && rev.time !== '—';
       var cls = isArr ? 'arr' : 'dep';
       // determine direction: prefer delayMin (arrival); else compare the two times
-      var late = delayMin != null ? delayMin > 0 : (changed ? (minsOf(times.revised) >= minsOf(times.scheduled)) : true);
+      // Compare full instants when both carry a date: minutes-of-day alone read a
+      // 23:50 -> 00:05 slip across midnight as "early". minsOf stays the fallback
+      // for bare HH:MM booking times.
+      var rMs = toMs(times.revised), sMs = toMs(times.scheduled);
+      var late = delayMin != null ? delayMin > 0 : (changed ? ((rMs != null && sMs != null) ? rMs >= sMs : (minsOf(times.revised) >= minsOf(times.scheduled))) : true);
       var html = '<div class="' + cls + '"><div class="ft-t-label">' + esc(label) + (sched.date ? ' · ' + sched.date : '') + '</div>';
       if (changed) {
         html += '<div class="ft-t-sched"><span class="ft-strike">' + esc(sched.time) + '</span> <span class="ft-t-rev ' + (late ? 'late' : 'early') + '">' + svg(late ? 'up' : 'down') + esc(rev.time) + '</span></div>';
