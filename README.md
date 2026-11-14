@@ -37,7 +37,9 @@ is active the field disappears, since it is a set-once setting. Non-admins never
 it. There is also an admin config API for scripted setup, and it takes precedence over
 the in-widget key. The plugin's settings page carries a **“Test AeroDataBox key”**
 button: it makes one AeroDataBox call and reports whether the key is accepted and how
-many requests are left this month.
+many requests are left this month. **“Show AeroDataBox quota”** reports the same
+balance without spending a request: what RapidAPI last said is left (and how long
+ago), plus the plugin's own count for the month.
 
 Every user then has two settings of their own under **Settings → Plugins → Flight
 Tracker**: **`notify_enabled`** (on/off, default on) turns the bell/email alerts off

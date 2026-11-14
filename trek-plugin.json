@@ -47,6 +47,10 @@
   },
   "actions": [
     {
+      "key": "quota",
+      "label": "Show AeroDataBox quota"
+    },
+    {
       "key": "test_key",
       "label": "Test AeroDataBox key"
     }

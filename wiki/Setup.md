@@ -80,6 +80,12 @@ key is accepted, and **how many requests are left this month**. Before 2.0.0 the
 had no way to show you the remaining quota at all — the only signal was data quietly
 going missing once the ceiling was hit.
 
+**"Show AeroDataBox quota"**, next to it, spends nothing: it reports the balance
+RapidAPI sent with the most recent lookup (in API units when RapidAPI bills in units),
+how long ago that was, and the plugin's own request count for the calendar month.
+When RapidAPI reports 5 or fewer left, the plugin stops calling AeroDataBox and checks
+again every 6 hours, because RapidAPI renews on your subscription date, not on the 1st.
+
 The test spends one request of your monthly allowance, so use it when something looks
 wrong rather than as a habit.
 

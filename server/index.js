@@ -52,6 +52,14 @@ const ADSB_MIN_GAP_MS = 1100;
 // after another, but nothing spaced their AeroDataBox calls: on a multi-leg trip
 // the second leg's lookup followed the first within a second and got a 429.
 const AERO_MIN_GAP_MS = 1100;
+// When RapidAPI itself says this few requests/units are left, stop spending them.
+// RapidAPI renews on the subscription date, not on the 1st, so the plugin's own
+// calendar-month counter cannot know this. A low reading is re-probed after
+// REMAINING_PROBE_MS, because only a real call can learn that the plan renewed.
+const AERO_RESERVE = 5;
+const REMAINING_PROBE_MS = 6 * 3600 * 1000;
+// How long one leg whose AeroDataBox lookup failed waits before it is tried again.
+const LEG_FAIL_BACKOFF_MS = 5 * 60 * 1000;
 // A forced refresh re-queries every leg with force=true, bypassing the TTL. Without
 // a floor, one user holding the refresh button burns the instance-wide monthly quota.
 const FORCE_COOLDOWN_MS = 60 * 1000;
@@ -402,7 +410,34 @@ async function keyInvalid(ctx) {
 // True when we may still spend an AeroDataBox request this month.
 async function aeroAllowed(ctx) {
   if (await keyInvalid(ctx)) return false;
+  const row = await rapidRemaining(ctx);
+  if (row && row.n <= AERO_RESERVE && (Date.now() - row.at) < REMAINING_PROBE_MS) return false;
   return (await quotaGet(ctx, monthKey())) < AERO_MONTHLY_BUDGET;
+}
+
+// What RapidAPI last reported as left on the plan, with WHEN it said so. quotaGet
+// cannot tell a stored 0 from a missing row, and both matter here.
+async function rapidRemaining(ctx) {
+  const rows = await attempt(() => ctx.db.query("SELECT n, updated_at FROM quota WHERE k = 'ada:remaining'"), []);
+  if (!rows || !rows[0] || rows[0].n == null) return null;
+  return { n: Number(rows[0].n), at: Number(rows[0].updated_at) || 0 };
+}
+
+// AeroDataBox bills its RapidAPI plans in API units, not requests, and RapidAPI
+// names the header after the billing object. Read whichever x-ratelimit-*-remaining
+// header the response carries, preferring a units one, instead of hardcoding one.
+function remainingHeader(headers) {
+  if (!headers || typeof headers.forEach !== 'function') return null;
+  let best = null;
+  headers.forEach((value, name) => {
+    const k = String(name).toLowerCase();
+    if (!/^x-ratelimit-.*-remaining$/.test(k)) return;
+    const n = Number(value);
+    if (value === '' || !isFinite(n)) return;
+    const units = /unit/.test(k);
+    if (!best || (units && !best.units)) best = { n, name: k, units };
+  });
+  return best;
 }
 
 // --- per-user settings -------------------------------------------------------
@@ -515,13 +550,15 @@ async function fetchAero(ctx, number, key, date) {
   // monthly quota also answers 429, and a second try there costs one request.
   if (r.status === 429) {
     ctx.log.warn('AeroDataBox rate limited, retrying once', { number: number, error: r.error });
+    await quotaBump(ctx, monthKey(), 1);   // the retry is a request like any other
     r = await aeroFetch(url, aeroOptions);
   }
   // RapidAPI reports what is actually left; prefer it over our own counter, which
   // cannot know about calls made before this version shipped or from elsewhere.
-  const remaining = r.headers && r.headers.get && r.headers.get('x-ratelimit-requests-remaining');
-  if (remaining != null && remaining !== '' && isFinite(Number(remaining))) {
-    await quotaSet(ctx, 'ada:remaining', Number(remaining));
+  const remaining = remainingHeader(r.headers);
+  if (remaining) {
+    await quotaSet(ctx, 'ada:remaining', remaining.n);
+    await quotaSet(ctx, 'ada:remaining_units', remaining.units ? 1 : 0);
   }
   if (r.status === 401 || r.status === 403) {
     // Remembered for KEY_INVALID_TTL_MS, and cleared outright when the key changes.
@@ -692,10 +729,18 @@ async function trackLeg(ctx, leg, key, win) {
   // plugin made on purpose as something having gone wrong.
   const notes = [];
   let status = null;
-  if (win.status) {
+  let statusAt = null;
+  // A status recent enough for this leg's own cadence (legStatusTtl) is reused
+  // instead of spending another AeroDataBox request on it.
+  const reuse = win.status ? win.reuse : null;
+  if (reuse) {
+    status = reuse.status;
+    statusAt = reuse.statusAt;
+  } else if (win.status && !win.skipStatus) {
     const aero = await fetchAero(ctx, leg.number, key, win.date);
     if (aero.error) errors.push('status: ' + aero.error);
     status = aero.data;
+    if (status) statusAt = Date.now();
   }
   let live = { data: null };
   // Fetch the live position when the flight is plausibly up: inside the booking's
@@ -746,7 +791,8 @@ async function trackLeg(ctx, leg, key, win) {
   // free/tenant-free broker). Skipped once the flight is in the past.
   let weather = null;
   const arr = status && status.arrival;
-  if (arr && arr.lat != null && arr.lon != null && win.status) {
+  if (reuse && reuse.weather) weather = reuse.weather;
+  if (arr && arr.lat != null && arr.lon != null && win.status && !reuse) {
     const wdate = (typeof arr.scheduled === 'string' ? arr.scheduled.slice(0, 10) : '') || win.date || null;
     const w = await attempt(() => ctx.weather.get(arr.lat, arr.lon, /^\d{4}-\d{2}-\d{2}$/.test(wdate || '') ? wdate : undefined), null);
     if (w && typeof w === 'object' && !w.error && typeof w.temp === 'number') {
@@ -770,7 +816,7 @@ async function trackLeg(ctx, leg, key, win) {
       if (a.lat != null && !a.onGround) inbound = a;
     }
   }
-  return Object.assign({}, leg, { status, live: live.data, weather, inbound, errors, notes });
+  return Object.assign({}, leg, { status, statusAt, live: live.data, weather, inbound, errors, notes });
 }
 
 // --- key resolution: instance-wide, admin-managed -----------------------------
@@ -852,7 +898,7 @@ async function requireOwnedReservation(ctx, tripId, reservationId) {
 
 // `resv` is supplied by the caller and has ALREADY passed the membership gate —
 // buildPayload never re-reads it, so there is no path here that bypasses the check.
-async function buildPayload(ctx, tripId, reservationId, forcedNumber, resv) {
+async function buildPayload(ctx, tripId, reservationId, forcedNumber, resv, force) {
   const key = await getKeyChecked(ctx);
   const hasKey = !!key;
 
@@ -945,10 +991,43 @@ async function buildPayload(ctx, tripId, reservationId, forcedNumber, resv) {
   // than risking a 502 that would lose the whole payload, including the parts that
   // did resolve.
   const deadline = Date.now() + 20000;
-  for (const l of queryable) {
-    const win = { status: statusWin, live: liveWin, date: legDate(l), deadline: deadline };
+  // The previous payload's legs, for per-leg reuse. Not on a forced refresh (the
+  // user asked for fresh data) nor for a typed number (a different flight).
+  let prevLegs = [];
+  if (!force && !forcedNumber) {
+    const prevRows = await attempt(() => ctx.db.query('SELECT payload FROM cache WHERE reservation_id = ? AND trip_id IS ?',
+      reservationId, tripId != null ? String(tripId) : null), []);
+    try {
+      const pp = prevRows && prevRows[0] && JSON.parse(prevRows[0].payload);
+      if (pp && Array.isArray(pp.legs)) prevLegs = pp.legs;
+    } catch (_e) { /* no reuse */ }
+  }
+  for (let i = 0; i < queryable.length; i++) {
+    const l = queryable[i];
+    const prev = prevLegs[i] && prevLegs[i].number === l.number ? prevLegs[i] : null;
+    const reusable = prev && prev.status && prev.statusAt &&
+      (Date.now() - Number(prev.statusAt)) < legStatusTtl(prev.status);
+    // A leg whose lookup just failed rests for LEG_FAIL_BACKOFF_MS on its own, so a
+    // stubborn 429 on the onward flight neither burns requests every minute nor
+    // slows the refresh of the flight that is in the air.
+    const resting = !reusable && prev && prev.statusFailAt && (Date.now() - Number(prev.statusFailAt)) < LEG_FAIL_BACKOFF_MS;
+    const win = { status: statusWin, live: liveWin, date: legDate(l), deadline: deadline,
+      reuse: reusable ? prev : null, skipStatus: !!resting };
     const tracked = await tryLog(ctx, 'trackLeg', () => trackLeg(ctx, l, key, win),
       Object.assign({}, l, { status: null, live: null, errors: ['failed'] }));
+    // A failed lookup (429, 5xx, timeout) must not blank what we already knew,
+    // e.g. a cancellation. Keep the last status; the error still shows and still
+    // shortens the cache lifetime, so the leg is retried soon.
+    if (tracked && !tracked.status && prev && prev.status && statusWin) {
+      tracked.status = prev.status;
+      tracked.statusAt = prev.statusAt;
+    }
+    if (tracked && resting) {
+      tracked.statusFailAt = prev.statusFailAt;
+      (prev.errors || []).forEach((e) => { if (/^status: /.test(String(e)) && tracked.errors.indexOf(e) === -1) tracked.errors.push(e); });
+    } else if (tracked && (tracked.errors || []).some((e) => /^status: /.test(String(e)))) {
+      tracked.statusFailAt = Date.now();
+    }
     legs.push(tracked);
   }
 
@@ -1014,6 +1093,30 @@ async function buildPayload(ctx, tripId, reservationId, forcedNumber, resv) {
 // — ~2900 lookups per reservation against a ~600/month quota, when nothing about a
 // schedule moves that far out. Refresh fast only when the data actually changes:
 // in the air, or close to departure.
+// How long ONE leg's AeroDataBox status stays good enough to reuse. The payload is
+// rebuilt every minute while any leg is in the air, and every rebuild used to
+// re-query EVERY leg: on FCO-DOH-MLE that is the onward flight, hours from
+// departure, bought again 300 times during the first flight. Each leg now follows
+// its own curve, so only the leg that is actually moving is polled at full speed.
+function legStatusTtl(st) {
+  if (!st) return 0;
+  const M = 60 * 1000, H = 3600 * 1000, now = Date.now();
+  const s = st.status;
+  const MOVING = { EnRoute: 1, Departed: 1, Approaching: 1, Boarding: 1, GateClosed: 1, Diverted: 1 };
+  if (MOVING[s]) return 0;
+  const arrU = toMs(st.arrival && (st.arrival.revisedUtc || st.arrival.scheduledUtc));
+  if (s === 'Arrived') return (arrU != null && now > arrU + 1 * H) ? 6 * H : 5 * M;   // belt may still change
+  if (s === 'Canceled' || s === 'CanceledUncertain') return 30 * M;
+  const depU = toMs(st.departure && (st.departure.revisedUtc || st.departure.scheduledUtc));
+  if (depU == null) return 5 * M;
+  const until = depU - now;
+  if (until < 1 * H) return 0;
+  if (until < 3 * H) return 5 * M;
+  if (until < 12 * H) return 15 * M;
+  if (until < 48 * H) return 30 * M;
+  return 2 * H;
+}
+
 function ttlFor(payload) {
   const M = 60 * 1000, H = 3600 * 1000;
   const b = (payload && payload.booking) || {};
@@ -1027,7 +1130,15 @@ function ttlFor(payload) {
   const errs = ((payload && payload.errors) || []).filter((e) => !/^live: skipped/.test(String(e)));
   if (errs.length) {
     const terminal = errs.some((e) => /key rejected|monthly quota/i.test(String(e)));
-    return terminal ? 6 * H : 10 * M;
+    if (terminal) return 6 * H;
+    // One leg failing must not freeze the leg the traveller is sitting on: with a
+    // flight in the air, retry after 2 minutes instead of 10. The failed leg keeps
+    // its last known status meanwhile (see buildPayload), so nothing goes blank.
+    const airborne = ((payload && payload.legs) || []).some((l) => {
+      const st = l && l.status && l.status.status;
+      return st === 'EnRoute' || st === 'Departed' || st === 'Approaching';
+    });
+    return airborne ? 2 * M : 10 * M;
   }
   const legs = (payload && payload.legs) || [];
   const moving = legs.some((l) => {
@@ -1076,7 +1187,7 @@ async function cachedPayload(ctx, tripId, reservationId, force, forcedNumber, re
       } catch (_e) { /* refetch */ }
     }
   }
-  const payload = await buildPayload(ctx, tripId, reservationId, forcedNumber, resv);
+  const payload = await buildPayload(ctx, tripId, reservationId, forcedNumber, resv, force);
   await tryLog(ctx, 'cache.write', () => ctx.db.exec(
     'INSERT OR REPLACE INTO cache (reservation_id, trip_id, payload, fetched_at) VALUES (?, ?, ?, ?)',
     reservationId, tid, JSON.stringify(payload), Date.now()));
@@ -1894,6 +2005,7 @@ module.exports = definePlugin({
               notes: u.tracked.notes,
             });
             if (u.tracked.status) merged.status = u.tracked.status;
+            if (u.tracked.status) merged.statusAt = u.tracked.statusAt || Date.now();
             p.legs[u.index] = merged;
             touched = true;
           }
@@ -1964,6 +2076,26 @@ module.exports = definePlugin({
   // Runs USER-BOUND via POST /api/plugin-settings/<id>/action, so ctx.config is
   // available. The result is normalised to { ok, message }, message capped at 200.
   actions: {
+    // Read-only: reports what is already stored, never calls AeroDataBox.
+    async quota(ctx) {
+      const key = await getKeyChecked(ctx);
+      if (!key) return { ok: false, message: 'No AeroDataBox key is configured.' };
+      const used = await quotaGet(ctx, monthKey());
+      const row = await rapidRemaining(ctx);
+      const units = (await quotaGet(ctx, 'ada:remaining_units')) === 1;
+      let msg = '';
+      if (row) {
+        const mins = Math.max(0, Math.round((Date.now() - row.at) / 60000));
+        const ago = mins < 60 ? mins + ' min' : Math.round(mins / 60) + ' h';
+        msg += 'RapidAPI: ' + row.n + (units ? ' units' : ' requests') + ' left (as of ' + ago + ' ago). ';
+      } else {
+        msg += 'RapidAPI has not reported a balance yet. ';
+      }
+      msg += 'Plugin count: ' + used + '/' + AERO_MONTHLY_BUDGET + ' this month.';
+      if (await keyInvalid(ctx)) msg += ' Key currently rejected.';
+      return { ok: row ? row.n > AERO_RESERVE : used < AERO_MONTHLY_BUDGET, message: msg.slice(0, 200) };
+    },
+
     async test_key(ctx) {
       const key = await getKeyChecked(ctx);
       if (!key) return { ok: false, message: 'No AeroDataBox key is configured. Without one the widget still shows the live adsb.fi position, but no schedule, gate or delay.' };
