@@ -533,9 +533,22 @@
     function toMs(s) { if (!s) return null; var n = Date.parse(String(s).replace(' ', 'T')); return isNaN(n) ? null : n; }
     function fmtClock(iso) {
       if (!iso) return { time: '—', date: '' };
+      var loc = (ctx && ctx.formats && ctx.formats.locale) || (ctx && ctx.locale) || 'en';
+      // An airport-local time carries its own offset ('YYYY-MM-DD HH:MM+03:00').
+      // Show that wall clock as is, so each column reads in its own airport's
+      // timezone: formatting the instant would put both columns in the viewer's
+      // device timezone and show a Doha arrival in Rome time.
+      var wc = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?[+-]\d{2}:?\d{2}$/);
+      if (wc) {
+        try {
+          var wall = Date.UTC(+wc[1], +wc[2] - 1, +wc[3], +wc[4], +wc[5]);
+          var wt = new Intl.DateTimeFormat(loc, { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: use12h }).format(wall);
+          var wd = new Intl.DateTimeFormat(loc, { timeZone: 'UTC', day: '2-digit', month: '2-digit' }).format(wall);
+          return { time: wt, date: wd };
+        } catch (e) { /* fall through */ }
+      }
       var ms = toMs(iso);
       if (ms != null) {
-        var loc = (ctx && ctx.formats && ctx.formats.locale) || (ctx && ctx.locale) || 'en';
         try {
           var t = new Intl.DateTimeFormat(loc, { hour: '2-digit', minute: '2-digit', hour12: use12h }).format(ms);
           var d = new Intl.DateTimeFormat(loc, { day: '2-digit', month: '2-digit' }).format(ms);
