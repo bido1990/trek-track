@@ -48,6 +48,10 @@ const SET_COOLDOWN_MS = 15 * 1000;
 // adsb.fi opendata is free and asks for <= 1 request/second. The old code spaced
 // LEGS but issued up to four calls inside one leg in a few milliseconds.
 const ADSB_MIN_GAP_MS = 1100;
+// AeroDataBox's BASIC plan also has a per-second ceiling. Legs are tracked one
+// after another, but nothing spaced their AeroDataBox calls: on a multi-leg trip
+// the second leg's lookup followed the first within a second and got a 429.
+const AERO_MIN_GAP_MS = 1100;
 // A forced refresh re-queries every leg with force=true, bypassing the TTL. Without
 // a floor, one user holding the refresh button burns the instance-wide monthly quota.
 const FORCE_COOLDOWN_MS = 60 * 1000;
@@ -136,6 +140,21 @@ function adsbFetch(path) {
   // The gate must advance even when a call rejects, or one failure stalls every
   // later adsb.fi request for the lifetime of the process.
   adsbGate = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// Same gate for AeroDataBox: one module-level queue, so the route, a forced
+// refresh and the background job can never burst against the per-second limit.
+let aeroGate = Promise.resolve();
+let aeroLastAt = 0;
+function aeroFetch(url, options) {
+  const run = aeroGate.then(async () => {
+    const wait = AERO_MIN_GAP_MS - (Date.now() - aeroLastAt);
+    if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+    aeroLastAt = Date.now();
+    return fetchJson(url, options);
+  });
+  aeroGate = run.then(() => undefined, () => undefined);
   return run;
 }
 
@@ -488,9 +507,16 @@ async function fetchAero(ctx, number, key, date) {
   const url = AERO_HOST + '/flights/number/' + encodeURIComponent(number) + datePath +
     '?withAircraftImage=false&withLocation=true&dateLocalRole=Both';
   await quotaBump(ctx, monthKey(), 1);
-  const r = await fetchJson(url, {
+  const aeroOptions = {
     headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'aerodatabox.p.rapidapi.com' },
-  });
+  };
+  let r = await aeroFetch(url, aeroOptions);
+  // A per-second 429 clears after the gate's next gap, so retry it once. The
+  // monthly quota also answers 429, and a second try there costs one request.
+  if (r.status === 429) {
+    ctx.log.warn('AeroDataBox rate limited, retrying once', { number: number, error: r.error });
+    r = await aeroFetch(url, aeroOptions);
+  }
   // RapidAPI reports what is actually left; prefer it over our own counter, which
   // cannot know about calls made before this version shipped or from elsewhere.
   const remaining = r.headers && r.headers.get && r.headers.get('x-ratelimit-requests-remaining');
@@ -503,7 +529,11 @@ async function fetchAero(ctx, number, key, date) {
     ctx.log.warn('AeroDataBox rejected the key', { status: r.status });
     return { data: null, error: 'key rejected (HTTP ' + r.status + ')' };
   }
-  if (!r.ok) return { data: null, error: r.error || 'aerodatabox error' };
+  if (!r.ok) {
+    // Previously returned silently: the error reached the widget but not the log.
+    ctx.log.warn('AeroDataBox request failed', { number: number, status: r.status, error: r.error });
+    return { data: null, error: r.error || 'aerodatabox error' };
+  }
   const list = Array.isArray(r.data) ? r.data
     : (r.data && Array.isArray(r.data.flights) ? r.data.flights
       : (r.data && r.data.departure ? [r.data] : []));
